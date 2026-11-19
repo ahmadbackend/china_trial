@@ -19,6 +19,7 @@ Usage:
 import argparse
 import gzip
 import hashlib
+import itertools
 import queue
 import signal
 import sys
@@ -30,15 +31,27 @@ import os as _os
 import sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
-from common import DETAIL_URL, HTML_DIR, Session, db, search_form   # noqa: E402
+from common import DETAIL_URL, HTML_DIR, ROOT, Session, db, search_form  # noqa: E402
+
+_errlog_lock = threading.Lock()
+_errlog = None
+
+def _log_error(tid, ctr, msg):
+    global _errlog
+    with _errlog_lock:
+        if _errlog is None:
+            _errlog = open(ROOT / "out" / "errors.log", "a", encoding="utf-8")
+        _errlog.write(f"{time.strftime('%H:%M:%S')} {ctr or tid} {msg}\n")
+        _errlog.flush()
 
 _tls = threading.local()
+_slot_counter = itertools.count()
 STOP = threading.Event()
 
 
 def sess():
     if not hasattr(_tls, "s"):
-        _tls.s = Session()
+        _tls.s = Session(slot=next(_slot_counter))
     return _tls.s
 
 
@@ -55,11 +68,9 @@ def fetch_one(task, use_gzip=False):
     if STOP.is_set():
         return None
     try:
-        # ckm_index is the row number the list page passes; any valid value
-        # works, so fall back to 1 when the index did not record one.
         form = search_form(1, id=tid, ckm_index=row_index or 1)
-        r = sess().post(DETAIL_URL, form, expect="detail")
-        body = r.content                      # keep the exact bytes served
+        r = sess().post(DETAIL_URL, form, expect="detail", tries=1)
+        body = r.content
         d = shard_dir(ctr or tid)
         d.mkdir(parents=True, exist_ok=True)
         path = d / ((ctr or tid) + ".html" + (".gz" if use_gzip else ""))
@@ -76,9 +87,11 @@ def fetch_one(task, use_gzip=False):
                 "html_sha256": hashlib.sha256(body).hexdigest(),
                 "html_fetched_at": now(), "html_error": None}
     except Exception as e:
+        msg = f"{type(e).__name__}: {e}"[:400]
+        _log_error(tid, ctr, msg)
         return {"id": tid, "html_path": None, "html_bytes": None,
                 "html_sha256": None, "html_fetched_at": now(),
-                "html_error": f"{type(e).__name__}: {e}"[:400]}
+                "html_error": msg}
 
 
 UPSERT = """
@@ -164,7 +177,6 @@ def main():
             pending.append(rec)
             if rec.get("html_error"):
                 n_err += 1
-                print(f"[!] {rec['id']}: {rec['html_error']}", flush=True)
             else:
                 n_ok += 1
                 n_bytes += rec["html_bytes"] or 0

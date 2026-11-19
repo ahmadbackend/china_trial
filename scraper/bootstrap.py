@@ -4,6 +4,7 @@ JS-challenge WAF (FSSBBIl1Ugzb* / MmEwMD cookies) and dump a session bundle
 (cookies + headers + UA) for curl_cffi to reuse.
 
 Usage:  python scraper/bootstrap.py [--headless] [--out out/session.json]
+        python scraper/bootstrap.py --proxy "https://user:pass@host:port"
 """
 import json, argparse, os, re, sys, time
 from pathlib import Path
@@ -16,18 +17,22 @@ WAF_PREFIX = "FSSBBIl1Ugzb"          # WAF cookie family on this host
 READY_MARKER = "searchfrm"           # only present once the real page is served
 
 
-async def grab(headless: bool, out_path: Path, timeout: float = 120.0):
+async def grab(headless: bool, out_path: Path, timeout: float = 120.0, proxy: str = None):
     browser = await uc.start(
         headless=headless,
         browser_args=["--lang=zh-CN,zh", "--disable-blink-features=AutomationControlled"],
     )
     try:
-        print("[*] opening index.html ...", flush=True)
-        page = await browser.get(f"{BASE}/index.html")
+        if proxy:
+            print(f"[*] creating proxied context ...", flush=True)
+            page = await browser.create_context(
+                url=f"{BASE}/index.html",
+                proxy_server=proxy,
+            )
+        else:
+            print("[*] opening index.html ...", flush=True)
+            page = await browser.get(f"{BASE}/index.html")
 
-        # The WAF serves HTTP 202 + obfuscated JS which sets the cookies and
-        # reloads. NOTE: the genuine pages embed that same WAF script, so the only
-        # dependable "we are through" signal is real page content appearing.
         deadline = time.time() + timeout
         while time.time() < deadline:
             await page.sleep(2)
@@ -35,10 +40,11 @@ async def grab(headless: bool, out_path: Path, timeout: float = 120.0):
             if "clinicaltrials.searchlist" in html and len(html) > 8000:
                 break
 
-        # Visit the search list so the WAF also blesses that path and the
-        # `token` cookie is minted.
         print("[*] opening search list ...", flush=True)
-        page = await browser.get(LIST_URL)
+        if proxy:
+            await page.get(LIST_URL)
+        else:
+            page = await browser.get(LIST_URL)
         deadline = time.time() + timeout
         total = None
         while time.time() < deadline:
@@ -53,13 +59,21 @@ async def grab(headless: bool, out_path: Path, timeout: float = 120.0):
             print("[!] search list never settled", file=sys.stderr)
 
         ua = await page.evaluate("navigator.userAgent")
-        raw = await browser.cookies.get_all()
 
-        cookies = {}
-        for c in raw:
-            dom = (getattr(c, "domain", "") or "").lstrip(".")
-            if "chinadrugtrials.org.cn" in dom:
-                cookies[c.name] = c.value
+        if proxy:
+            raw = await page.send(uc.cdp.network.get_cookies())
+            cookies = {}
+            for c in raw:
+                dom = (c.domain or "").lstrip(".")
+                if "chinadrugtrials.org.cn" in dom:
+                    cookies[c.name] = c.value
+        else:
+            raw = await browser.cookies.get_all()
+            cookies = {}
+            for c in raw:
+                dom = (getattr(c, "domain", "") or "").lstrip(".")
+                if "chinadrugtrials.org.cn" in dom:
+                    cookies[c.name] = c.value
 
         waf = [k for k in cookies if k.startswith(WAF_PREFIX)]
         bundle = {
@@ -67,6 +81,7 @@ async def grab(headless: bool, out_path: Path, timeout: float = 120.0):
             "user_agent": ua,
             "cookies": cookies,
             "total_records": total,
+            "proxy": proxy,
             "headers": {
                 "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
                           "image/avif,image/webp,image/apng,*/*;q=0.8",
@@ -89,6 +104,8 @@ async def grab(headless: bool, out_path: Path, timeout: float = 120.0):
         print(f"[+] WAF cookies present: {waf or 'NONE (!)'} ")
         print(f"[+] total records reported by site: {total}")
         print(f"[+] UA: {ua}")
+        if proxy:
+            print(f"[+] proxy: ...{proxy.split('@')[-1]}")
         print(f"[+] wrote {out_path}")
         return bundle
     finally:
@@ -102,10 +119,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--headless", action="store_true")
     ap.add_argument("--out", default="out/session.json")
+    ap.add_argument("--proxy", default=None, help="https://user:pass@host:port")
     a = ap.parse_args()
     out = Path(a.out)
     try:
-        uc.loop().run_until_complete(grab(a.headless, out))
+        uc.loop().run_until_complete(grab(a.headless, out, proxy=a.proxy))
     except Exception as e:
         print(f"[!] bootstrap error: {type(e).__name__}: {e}", file=sys.stderr)
 

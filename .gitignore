@@ -2,3 +2,6 @@ capture_www.chinadrugtrials.org.cn_20261110-195919/
 downloaded_files/
 out/
 **/*.json
+**/__pycache__/
+proxies.txt
+
