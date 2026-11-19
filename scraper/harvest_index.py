@@ -17,10 +17,42 @@ from datetime import datetime, timezone
 import os as _os, sys as _sys
 _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
 
-from common import LIST_URL, Session, db, parse_list_page, search_form, PAGE_SIZE
+from common import LIST_URL, Session, db, parse_list_page, row_sig, search_form, \
+    PAGE_SIZE
 
 _tls = threading.local()
 _lock = threading.Lock()
+
+# On re-scans, refresh the summary fields and flag the trial for re-download
+# when its row changed since it was first recorded. first_seen is only set on
+# the initial INSERT, so it always marks when the trial was first discovered.
+_UPSET_COLS = """
+  ctr_no=excluded.ctr_no, state=excluded.state, drug_name=excluded.drug_name,
+  indication=excluded.indication, popular_title=excluded.popular_title,
+  needs_refetch=CASE WHEN trials.row_sig IS NOT NULL
+                       AND trials.row_sig <> excluded.row_sig
+                     THEN 1 ELSE trials.needs_refetch END,
+  row_sig=excluded.row_sig
+"""
+
+# Partial save: rows from a page that is being flagged for retry.
+UPSERT_PARTIAL = """
+INSERT INTO trials(id,ctr_no,state,drug_name,indication,popular_title,
+                   list_page,row_index,row_sig,first_seen)
+VALUES(:id,:ctr_no,:state,:drug_name,:indication,:popular_title,:page,
+       :row_index,:sig,:seen)
+ON CONFLICT(id) DO UPDATE SET
+""" + _UPSET_COLS
+
+# Full save: a complete page, so list position is refreshed too.
+UPSERT_FULL = """
+INSERT INTO trials(id,ctr_no,state,drug_name,indication,popular_title,
+                   list_page,row_index,row_sig,first_seen)
+VALUES(:id,:ctr_no,:state,:drug_name,:indication,:popular_title,:page,
+       :row_index,:sig,:seen)
+ON CONFLICT(id) DO UPDATE SET
+  list_page=excluded.list_page, row_index=excluded.row_index,
+""" + _UPSET_COLS
 
 
 def sess():
@@ -99,15 +131,13 @@ def main():
             # mark it for retry. The ids are a primary key, so re-fetching the
             # page later simply fills in the rest.
             if isinstance(rows, list) and rows:
-                con.executemany(
-                    "INSERT INTO trials(id,ctr_no,state,drug_name,indication,"
-                    "popular_title,list_page,row_index) VALUES(:id,:ctr_no,:state,"
-                    ":drug_name,:indication,:popular_title,:page,:row_index) "
-                    "ON CONFLICT(id) DO UPDATE SET ctr_no=excluded.ctr_no, "
-                    "state=excluded.state, drug_name=excluded.drug_name, "
-                    "indication=excluded.indication, "
-                    "popular_title=excluded.popular_title",
-                    [dict(r, page=page) for r in rows])
+                seen = now()
+                stamped = [dict(r, page=page, sig=row_sig(r), seen=seen)
+                           for r in rows]
+                if err:
+                    con.executemany(UPSERT_PARTIAL, stamped)
+                else:
+                    con.executemany(UPSERT_FULL, stamped)
                 n_rows += len(rows)
             if err or not isinstance(rows, list):
                 con.execute("INSERT OR REPLACE INTO pages(page,n_ids,fetched_at,error)"
@@ -117,18 +147,9 @@ def main():
                 n_err += 1
                 print(f"[!] page {page}: {err}", flush=True)
                 return
-            con.executemany(
-                "INSERT INTO trials(id,ctr_no,state,drug_name,indication,popular_title,"
-                "list_page,row_index) VALUES(:id,:ctr_no,:state,:drug_name,:indication,"
-                ":popular_title,:page,:row_index) ON CONFLICT(id) DO UPDATE SET "
-                "ctr_no=excluded.ctr_no, state=excluded.state, drug_name=excluded.drug_name,"
-                "indication=excluded.indication, popular_title=excluded.popular_title,"
-                "list_page=excluded.list_page, row_index=excluded.row_index",
-                [dict(r, page=page) for r in rows])
             con.execute("INSERT OR REPLACE INTO pages(page,n_ids,fetched_at,error)"
                         " VALUES(?,?,?,NULL)", (page, len(rows), now()))
             n_ok += 1
-            n_rows += len(rows)
 
     with cf.ThreadPoolExecutor(a.workers) as ex:
         for i, (page, rows, err) in enumerate(ex.map(do_page, todo), 1):

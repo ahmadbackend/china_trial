@@ -26,8 +26,8 @@ from common import ROOT, db
 OUT = ROOT / "out" / "export"
 
 INDEX_COLS = ["ctr_no", "id", "state", "drug_name", "indication", "popular_title",
-              "list_page", "row_index", "doc_path", "doc_bytes", "doc_sha256",
-              "fetched_at", "parsed_at", "error"]
+              "list_page", "row_index", "first_seen", "doc_path", "doc_bytes",
+              "doc_sha256", "fetched_at", "parsed_at", "error"]
 
 # Fields promoted to the front of trials_flat.csv when present.
 PREFERRED = [

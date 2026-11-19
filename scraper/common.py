@@ -1,5 +1,5 @@
 """Shared session / WAF / storage layer for the chinadrugtrials.org.cn harvester."""
-import itertools, json, re, sqlite3, subprocess, sys, threading, time
+import itertools, hashlib, json, re, sqlite3, subprocess, sys, threading, time
 from pathlib import Path
 
 from curl_cffi import requests as cr
@@ -314,6 +314,15 @@ class Session:
         raise RuntimeError(f"giving up after {tries} tries: {last}")
 
 
+def row_sig(row):
+    """Fingerprint of the list-row fields; a changed sig means the site edited
+    the trial's summary row, so its document should be re-fetched."""
+    return hashlib.md5("\x1f".join(
+        row.get(k) or "" for k in
+        ("state", "drug_name", "indication", "popular_title")
+    ).encode("utf-8")).hexdigest()
+
+
 # ---------- storage ----------
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS trials (
@@ -337,7 +346,10 @@ CREATE TABLE IF NOT EXISTS trials (
   html_bytes    INTEGER,
   html_sha256   TEXT,
   html_fetched_at TEXT,
-  html_error    TEXT
+  html_error    TEXT,
+  row_sig       TEXT,
+  needs_refetch INTEGER DEFAULT 0,
+  first_seen    TEXT
 );
 CREATE TABLE IF NOT EXISTS pages (
   page       INTEGER PRIMARY KEY,
@@ -356,6 +368,9 @@ LATE_COLUMNS = {
     "html_sha256": "TEXT",
     "html_fetched_at": "TEXT",
     "html_error": "TEXT",
+    "row_sig": "TEXT",
+    "needs_refetch": "INTEGER DEFAULT 0",
+    "first_seen": "TEXT",
 }
 
 

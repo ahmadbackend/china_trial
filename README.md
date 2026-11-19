@@ -54,6 +54,29 @@ It will self-test, clear the WAF, walk the index, download every document, parse
 them and write the exports — retrying failures and resuming cleanly. Stop it with
 Ctrl-C and run the same line again whenever you like; nothing is re-downloaded.
 
+### Run modes
+
+```powershell
+python -X utf8 scraper\run_all.py                 # resume whatever is incomplete
+python -X utf8 scraper\run_all.py --full-run      # WIPE everything, start from zero
+python -X utf8 scraper\run_all.py --full-run --retry-errors
+                                                  # resume an interrupted full run
+python -X utf8 scraper\run_all.py --new-trials    # frequent update
+```
+
+- **(default)** — resume: fetches whatever is still missing, never wipes anything.
+- **`--full-run`** — deletes the database, all downloaded documents and the
+  exports (asks for confirmation first; use `--yes` to skip the prompt), then
+  harvests everything from scratch. If that run is interrupted, restart it with
+  **`--full-run --retry-errors`**: that resumes *without* wiping and retries the
+  failed rows.
+- **`--new-trials`** — the frequent update. Re-scans all ~1,860 listing pages,
+  then downloads only trials that are **new** (not recorded in the database yet)
+  or whose list row **changed** since they were recorded (e.g. status moved from
+  进行中 to 已完成 — detected by a fingerprint of the summary row). Trials already
+  collected and unchanged are not touched. The exports are rebuilt at the end,
+  so `out/export/` always reflects everything collected so far.
+
 Check progress at any time (no network needed, safe with the VPN off):
 
 ```powershell
@@ -139,6 +162,7 @@ out/
   docs/<nn>/CTR########.doc[.gz]      the official documents, sharded by CTR suffix
   export/
     trials_index.csv        37,197 rows: the list-page summary + doc path + sha256
+                            (first_seen = when each trial was first discovered)
     trials_flat.csv         one row per trial, one column per common field  <- start here
     trials_full.jsonl       one JSON object per trial: all fields, sections, tables
     field_coverage.csv      every field name and how often it occurs
@@ -172,11 +196,11 @@ search, plus a sha256 of the original file for provenance.
 
 | Script | Role |
 |---|---|
-| `run_all.py` | supervisor: runs every phase, retries, reports status |
+| `run_all.py` | supervisor: runs every phase, retries, reports status; modes `--full-run` / `--new-trials` |
 | `selftest.py` | **offline** checks against the recorded capture — no network |
 | `bootstrap.py` | nodriver: clears the WAF, writes `out/session.json` |
-| `harvest_index.py` | walks the 1,860 result pages, records every trial GUID |
-| `harvest_details.py` | downloads and parses each document |
+| `harvest_index.py` | walks the 1,860 result pages, records every trial GUID; flags changed rows |
+| `harvest_details.py` | downloads and parses each document; `--refetch` re-fetches changed trials |
 | `parse_doc.py` | WordML → fields / sections / tables (also a CLI: pass it a `.doc`) |
 | `export.py` | `trials.db` → CSV + JSONL |
 
@@ -189,12 +213,14 @@ python -X utf8 scraper\export.py
 ```
 
 Useful flags: `--limit N` (smoke test), `--pages 1-50` (index slice),
-`--retry-errors`, `--no-parse`, `--skip-index`.
+`--refresh` (re-scan pages already done), `--retry-errors`, `--refetch`,
+`--no-parse`, `--skip-index`.
 
 ### Verifying changes without the VPN
 
 `selftest.py` validates both parsers against the fixtures in the recorded
-capture and exercises the database and export paths — 45 assertions, no network:
+capture and exercises the database, change-detection and export paths — 61
+assertions, no network:
 
 ```powershell
 python -X utf8 scraper\selftest.py

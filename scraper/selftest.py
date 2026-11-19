@@ -16,8 +16,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from common import ROOT, parse_list_page, search_form, SCHEMA  # noqa: E402
+from common import ROOT, db as open_db, parse_list_page, row_sig, search_form, \
+    SCHEMA  # noqa: E402
 from parse_doc import parse_wordml                             # noqa: E402
+import harvest_index                                           # noqa: E402
+import harvest_details                                         # noqa: E402
 
 CAPTURE = next(ROOT.glob("capture_www.chinadrugtrials.org.cn_*"), None)
 PASS, FAIL = [], []
@@ -162,6 +165,57 @@ def test_db_and_export(rec):
         con.close()
 
 
+def test_change_detection():
+    print("\n[4b] change detection on re-scan (row_sig / needs_refetch)")
+    with tempfile.TemporaryDirectory() as td:
+        con = open_db(Path(td) / "t.db")   # applies LATE_COLUMNS migrations
+        row = {"id": "1" * 32, "ctr_no": "CTR20260001", "state": "进行中",
+               "drug_name": "d", "indication": "i", "popular_title": "t",
+               "row_index": 1}
+        seen = "2026-01-01T00:00:00+00:00"
+
+        def scan(r, page=1):
+            con.execute(harvest_index.UPSERT_FULL,
+                        dict(r, page=page, sig=row_sig(r), seen=seen))
+
+        scan(row)
+        rec = con.execute(
+            "SELECT needs_refetch, first_seen, row_sig FROM trials").fetchone()
+        check("new row starts unflagged", rec[0] in (0, None), str(rec))
+        check("first_seen recorded on discovery", rec[1] == seen, str(rec))
+        check("row_sig stored", bool(rec[2]))
+
+        scan(row, page=2)          # re-scan, nothing changed
+        rec = con.execute("SELECT needs_refetch, list_page FROM trials").fetchone()
+        check("unchanged row is not flagged", rec[0] in (0, None), str(rec))
+        check("list position refreshed on re-scan", rec[1] == 2, str(rec))
+
+        scan(dict(row, state="已完成"))   # the site edited the row
+        (flag,) = con.execute("SELECT needs_refetch FROM trials").fetchone()
+        check("changed row is flagged for re-fetch", flag == 1, str(flag))
+        (fs,) = con.execute("SELECT first_seen FROM trials").fetchone()
+        check("first_seen survives re-scans", fs == seen, str(fs))
+
+        ok = {"id": row["id"], "doc_path": "docs/x.doc", "doc_bytes": 10,
+              "doc_sha256": "ab", "fetched_at": "t", "parsed_at": "t",
+              "fields_json": "{}", "rows_json": "[]", "error": None,
+              "ctr_no": row["ctr_no"]}
+        con.execute(harvest_details.UPSERT, ok)
+        (flag,) = con.execute("SELECT needs_refetch FROM trials").fetchone()
+        check("successful fetch clears the flag", flag == 0, str(flag))
+
+        con.execute("UPDATE trials SET needs_refetch=1")
+        con.execute(harvest_details.UPSERT,
+                    dict(ok, doc_path=None, doc_bytes=None, doc_sha256=None,
+                         parsed_at=None, fields_json=None, rows_json=None,
+                         error="boom"))
+        flag, dp = con.execute(
+            "SELECT needs_refetch, doc_path FROM trials").fetchone()
+        check("failed fetch keeps the flag", flag == 1, str(flag))
+        check("failed fetch leaves the row pending", dp is None, str(dp))
+        con.close()
+
+
 def main():
     print("=" * 66)
     print("chinadrugtrials harvester - offline self-test (no network needed)")
@@ -172,6 +226,7 @@ def main():
     test_suffixed_ids()
     rec = test_doc_parsing()
     test_db_and_export(rec)
+    test_change_detection()
     print("\n" + "=" * 66)
     print(f"{len(PASS)} passed, {len(FAIL)} failed")
     if FAIL:

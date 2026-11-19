@@ -15,6 +15,8 @@ Usage:
   python scraper/harvest_details.py --limit 25       # smoke test
   python scraper/harvest_details.py --gzip           # store .doc.gz (~10x smaller)
   python scraper/harvest_details.py --retry-errors   # re-attempt failures
+  python scraper/harvest_details.py --refetch        # also re-fetch trials whose
+                                                     # list row changed on re-scan
 """
 import argparse
 import gzip
@@ -98,7 +100,8 @@ def fetch_one(task, do_parse=True, use_gzip=False):
 UPSERT = """
 UPDATE trials SET doc_path=:doc_path, doc_bytes=:doc_bytes, doc_sha256=:doc_sha256,
   fetched_at=:fetched_at, parsed_at=:parsed_at, fields_json=:fields_json,
-  rows_json=:rows_json, error=:error, ctr_no=COALESCE(:ctr_no, ctr_no)
+  rows_json=:rows_json, error=:error, ctr_no=COALESCE(:ctr_no, ctr_no),
+  needs_refetch=CASE WHEN :error IS NULL THEN 0 ELSE needs_refetch END
 WHERE id=:id
 """
 
@@ -110,12 +113,17 @@ def main():
     ap.add_argument("--gzip", action="store_true", help="store .doc.gz")
     ap.add_argument("--no-parse", action="store_true", help="download only")
     ap.add_argument("--retry-errors", action="store_true")
+    ap.add_argument("--refetch", action="store_true",
+                    help="also re-fetch trials flagged needs_refetch (list row "
+                         "changed on a re-scan), even though they have a doc")
     a = ap.parse_args()
 
     con = db()
     where = "doc_path IS NULL OR doc_bytes IS NULL"
     if a.retry_errors:
         where += " OR error IS NOT NULL"
+    if a.refetch:
+        where += " OR needs_refetch=1"
     sql = f"SELECT id, ctr_no FROM trials WHERE {where} ORDER BY ctr_no DESC"
     if a.limit:
         sql += f" LIMIT {a.limit}"
@@ -204,7 +212,7 @@ def main():
     el = time.time() - t0
     print(f"\n[=] fetched {n_ok} docs ({n_bytes/1e6:.0f} MB) in {el/60:.1f} min, {n_err} errors")
     (left,) = con.execute(
-        "SELECT COUNT(*) FROM trials WHERE doc_path IS NULL").fetchone()
+        f"SELECT COUNT(*) FROM trials WHERE {where}").fetchone()
     if left:
         print(f"[i] {left} still pending - re-run this command to continue")
     if n_ok:
